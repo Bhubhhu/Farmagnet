@@ -42,6 +42,17 @@ def load(name): return json.load(open(os.path.join(HERE, "data", name), encoding
 @st.cache_data(ttl=600, show_spinner="Reading live weather...")
 def fetch(lat, lon): return live_weather(None, KEY, lat, lon)
 
+def inside(pt, geom):
+    """Ray-casting point-in-polygon on a GeoJSON Polygon/MultiPolygon (holes ignored: districts have none that matter)."""
+    x, y = pt
+    polys = [geom["coordinates"]] if geom["type"] == "Polygon" else geom["coordinates"]
+    for poly in polys:
+        ring, c = poly[0], False
+        for (x1, y1), (x2, y2) in zip(ring, ring[1:] + ring[:1]):
+            if (y1 > y) != (y2 > y) and x < (x2 - x1) * (y - y1) / (y2 - y1) + x1: c = not c
+        if c: return True
+    return False
+
 def bounds(feats):
     pts = []
     def walk(c):
@@ -94,8 +105,12 @@ with left:
                                                      fillOpacity=.5 if f["properties"]["district"] == sel else .06, color="#FFFFFF", weight=1.4),
                        highlight_function=lambda f: dict(fillColor="#B7F25C", fillOpacity=.45, color="#B7F25C", weight=3),
                        tooltip=folium.GeoJsonTooltip(["district"], labels=False)).add_to(m)
-        hit = st_folium(m, height=640, use_container_width=True, returned_objects=["last_active_drawing"], key=f"state-{ss.state}").get("last_active_drawing")
-        p = (hit or {}).get("properties", {})
+        out = st_folium(m, height=640, use_container_width=True, returned_objects=["last_active_drawing", "last_clicked"], key=f"state-{ss.state}")
+        p = ((out.get("last_active_drawing") or {}).get("properties")) or {}
+        ck = out.get("last_clicked")
+        if not p.get("district") and ck:  # fallback: locate the clicked district ourselves
+            p = next((f["properties"] for f in feats if inside((ck["lng"], ck["lat"]), f["geometry"])), {})
+        if st.query_params.get("debug"): st.caption(f"debug: drawing={out.get('last_active_drawing') is not None} clicked={ck} picked={p.get('district')}")
         if p.get("district") and p["district"] != ss.district:
             if not KEY:
                 ss.err = "The server has no OpenWeatherMap key. Add OWM_API_KEY under the app's Secrets and reboot."
