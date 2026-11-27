@@ -1,8 +1,8 @@
-import os, folium, streamlit as st
+import json, os, folium, streamlit as st
 from streamlit_folium import st_folium
-from agent import predict, live_weather, SCENARIOS, IRRIGATION, PEST
+from agent import predict, live_weather, IRRIGATION, PEST
 
-st.set_page_config(page_title="FarmAgent", page_icon="🌾", layout="wide")
+st.set_page_config(page_title="FarmAgent India", page_icon="🌾", layout="wide")
 
 try: KEY = st.secrets["OWM_API_KEY"]
 except Exception: KEY = os.getenv("OWM_API_KEY")
@@ -10,8 +10,9 @@ except Exception: KEY = os.getenv("OWM_API_KEY")
 st.markdown("""<style>
 #MainMenu, footer {visibility:hidden}
 .block-container {padding-top:1.5rem; max-width:1250px}
-.hero {background:linear-gradient(120deg,#2F7D4F,#6FA84A 60%,#E0A526); border-radius:20px; padding:26px 32px; color:#FFFBEA; margin-bottom:18px}
-.hero h1 {margin:0; font-size:2.2rem; color:#FFFBEA} .hero p {margin:6px 0 0; font-size:1.05rem; opacity:.95}
+.hero {background:linear-gradient(120deg,#2F7D4F,#6FA84A 60%,#E0A526); border-radius:20px; padding:24px 32px; color:#FFFBEA; margin-bottom:14px}
+.hero h1 {margin:0; font-size:2.1rem; color:#FFFBEA} .hero p {margin:6px 0 0; font-size:1.05rem; opacity:.95}
+.crumb {font-size:1.1rem; font-weight:700; color:#1F3D2B; margin:2px 0 8px}
 .tiles {display:grid; grid-template-columns:repeat(3,1fr); gap:10px; margin:10px 0 16px}
 .tile {background:#FFFBEA; border:2px solid #CFE3B4; border-radius:14px; padding:10px 14px}
 .tile b {display:block; font-size:1.35rem; color:#1F3D2B} .tile span {font-size:.8rem; color:#4C7A55; text-transform:uppercase; letter-spacing:.05em}
@@ -20,49 +21,79 @@ st.markdown("""<style>
 .card h2 {margin:2px 0 6px; font-size:1.7rem; color:#FFFBEA} .card p {margin:0 0 10px; font-size:1rem}
 .bar {background:rgba(255,251,234,.3); border-radius:99px; height:9px} .bar i {display:block; height:9px; border-radius:99px; background:#FFFBEA}
 .place {font-size:1.25rem; font-weight:700; color:#1F3D2B; margin-top:4px}
-div[data-testid="stPills"] button {border-radius:99px; border:2px solid #6FA84A; background:#FFFBEA}
-div[data-testid="stPills"] button[aria-checked="true"], div[data-testid="stPills"] button[kind="pillsActive"] {background:#2F7D4F; color:#FFFBEA}
 </style>""", unsafe_allow_html=True)
 
-st.markdown("""<div class="hero"><h1>🌾 FarmAgent</h1>
-<p>Click anywhere on the map. FarmAgent reads the live weather there and tells you what to do with water and pests today.</p></div>""", unsafe_allow_html=True)
+st.markdown("""<div class="hero"><h1>🌾 FarmAgent India</h1>
+<p>Pick a state, then a district. FarmAgent reads the live weather there and tells you what to do about irrigation and pests today.</p></div>""", unsafe_allow_html=True)
 
-@st.cache_data(ttl=600, show_spinner=False)
-def fetch(city=None, lat=None, lon=None): return live_weather(city, KEY, lat, lon)
+HERE = os.path.dirname(__file__)
+@st.cache_data
+def load(name): return json.load(open(os.path.join(HERE, "data", name), encoding="utf-8"))
 
-QUICK = {"Ludhiana": "Ludhiana", "Mumbai": "Mumbai", "Nairobi": "Nairobi", "Seattle": "Seattle", "Kochi": "Kochi",
-         "🔥 Hot & dry scenario": "hot_dry", "🌧️ Humid & rainy scenario": "humid_rainy"}
-st.session_state.setdefault("w", None); st.session_state.setdefault("seen", None)
+@st.cache_data(ttl=600, show_spinner="Reading live weather...")
+def fetch(lat, lon): return live_weather(None, KEY, lat, lon)
 
-pick = st.pills("Quick picks", list(QUICK), label_visibility="collapsed")
+def bounds(feats):
+    pts = []
+    def walk(c):
+        if isinstance(c[0], (int, float)): pts.append(c)
+        else:
+            for x in c: walk(x)
+    for f in feats: walk(f["geometry"]["coordinates"])
+    xs, ys = [p[0] for p in pts], [p[1] for p in pts]
+    return [[min(ys), min(xs)], [max(ys), max(xs)]]
+
+SEA = "<style>.leaflet-container{background:#CFE8F3}</style>"
+PALETTE = ["#6FA84A", "#8FBF5A", "#E0A526", "#4FA3A5", "#D9843F", "#A8C65A"]
+ss = st.session_state
+ss.setdefault("state", None); ss.setdefault("district", None); ss.setdefault("w", None)
+
 left, right = st.columns([3, 2], gap="large")
 with left:
-    w = st.session_state.w
-    m = folium.Map(location=[w["lat"], w["lon"]] if w and "lat" in w else [22, 20], zoom_start=6 if w and "lat" in w else 2,
-                   tiles="https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}", attr="Esri World Imagery")
-    if w and "lat" in w:
-        folium.Marker([w["lat"], w["lon"]], tooltip=w["city"], icon=folium.Icon(color="green", icon="leaf")).add_to(m)
-    click = st_folium(m, height=520, use_container_width=True, returned_objects=["last_clicked"]).get("last_clicked")
-
-# Process one new input per run: quick pick or map click.
-try:
-    if pick and pick != st.session_state.seen:
-        st.session_state.seen = pick
-        v = QUICK[pick]
-        st.session_state.w = SCENARIOS[v] if v in SCENARIOS else fetch(city=v)
-        st.rerun()
-    elif click and click != st.session_state.get("last_click"):
-        st.session_state.last_click = click
-        if not KEY: st.warning("Live weather isn't configured on this server. Use a scenario quick pick.")
-        else:
-            st.session_state.w = fetch(lat=round(click["lat"], 2), lon=round(click["lng"], 2)); st.rerun()
-except Exception as e:
-    st.error(f"Couldn't get weather for that spot ({e}). Try another place.")
+    if ss.state is None:
+        st.markdown('<div class="crumb">🇮🇳 India: click a state</div>', unsafe_allow_html=True)
+        m = folium.Map(location=[22.5, 80.5], zoom_start=4, tiles=None, zoom_control=True, min_zoom=4, max_zoom=7)
+        m.get_root().header.add_child(folium.Element(SEA))
+        states = load("states.geojson")
+        names = sorted(f["properties"]["state"] for f in states["features"])
+        folium.GeoJson(states, style_function=lambda f: dict(fillColor=PALETTE[names.index(f["properties"]["state"]) % len(PALETTE)],
+                       color="#1F3D2B", weight=1.6, fillOpacity=.85),
+                       highlight_function=lambda f: dict(fillColor="#C8553D", weight=3, fillOpacity=.95),
+                       tooltip=folium.GeoJsonTooltip(["state"], labels=False)).add_to(m)
+        m.fit_bounds([[6.5, 68], [37.5, 97.5]])
+        hit = st_folium(m, height=600, use_container_width=True, returned_objects=["last_active_drawing"], key="india").get("last_active_drawing")
+        if hit and hit.get("properties", {}).get("state"):
+            ss.state, ss.district, ss.w = hit["properties"]["state"], None, None
+            st.rerun()
+    else:
+        a, b = st.columns([1, 3])
+        if a.button("← All India"): ss.state = ss.district = ss.w = None; st.rerun()
+        b.markdown(f'<div class="crumb">India › {ss.state}: click a district</div>', unsafe_allow_html=True)
+        feats = [f for f in load("districts.geojson")["features"] if f["properties"]["state"] == ss.state]
+        m = folium.Map(tiles=None, zoom_control=True)
+        m.get_root().header.add_child(folium.Element(SEA))
+        sel = ss.district
+        folium.GeoJson({"type": "FeatureCollection", "features": feats},
+                       style_function=lambda f: dict(fillColor="#E0A526" if f["properties"]["district"] == sel else "#8FBF5A",
+                                                     color="#1F3D2B", weight=1.2, fillOpacity=.9),
+                       highlight_function=lambda f: dict(fillColor="#C8553D", weight=3, fillOpacity=.95),
+                       tooltip=folium.GeoJsonTooltip(["district"], labels=False)).add_to(m)
+        m.fit_bounds(bounds(feats))
+        hit = st_folium(m, height=600, use_container_width=True, returned_objects=["last_active_drawing"], key=f"state-{ss.state}").get("last_active_drawing")
+        p = (hit or {}).get("properties", {})
+        if p.get("district") and p["district"] != ss.district:
+            if not KEY: st.warning("Live weather isn't configured on this server.")
+            else:
+                try:
+                    w = fetch(p["lat"], p["lon"]); w["city"] = f'{p["district"]}, {ss.state}'
+                    ss.district, ss.w = p["district"], w; st.rerun()
+                except Exception as e: st.error(f"Couldn't get weather for {p['district']} ({e}).")
 
 with right:
-    w = st.session_state.w
+    w = ss.w
     if not w:
-        st.markdown('<div class="card" style="background:#2A7FA8"><small>Waiting</small><h2>👈 Pick a place</h2><p>Click the map or choose a quick pick to get advice for today.</p></div>', unsafe_allow_html=True)
+        msg = "Click a state on the map." if ss.state is None else f"Click a district of {ss.state}."
+        st.markdown(f'<div class="card" style="background:#2A7FA8"><small>Waiting</small><h2>👈 {msg}</h2><p>The prediction and advice appear here.</p></div>', unsafe_allow_html=True)
     else:
         r = predict(w)
         IC = {"skip": ("#2A7FA8", "🌧️ Skip irrigation"), "light": ("#C98A12", "💧 Light irrigation"), "heavy": ("#C8553D", "💦 Irrigate heavily")}
@@ -76,4 +107,4 @@ with right:
             st.markdown(f'<div class="card" style="background:{col}"><small>{kind} · {p:.0%} confident</small><h2>{title}</h2><p>{TXT[lab]}</p>'
                         f'<div class="bar"><i style="width:{p:.0%}"></i></div></div>', unsafe_allow_html=True)
         if w["wind_ms"] > 8: st.warning("Wind is strong: postpone any spraying.")
-st.caption("Models trained on Open-Meteo history; labels from FAO-56 water balance and agronomy thresholds. Guidance only.")
+st.caption("Weather is read at a point inside each district. Boundaries are simplified and pre-2014/2019 (Telangana is inside Andhra Pradesh, Ladakh inside Jammu & Kashmir). Guidance only.")
