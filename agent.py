@@ -11,14 +11,15 @@ SCENARIOS = {
     "humid_rainy": dict(city="Humid & rainy day", temp_c=22, humidity=92, wind_ms=1.5, pressure_hpa=1010, clouds=95, rain_24h_mm=14.0),
 }
 
-def live_weather(city, key):
+def live_weather(city=None, key=None, lat=None, lon=None):
     """Current conditions + next-24h forecast rain (8 x 3h slots) from OpenWeatherMap free tier."""
-    p = dict(q=city, appid=key, units="metric")
+    p = dict(appid=key, units="metric")
+    p.update(lat=lat, lon=lon) if lat is not None else p.update(q=city)
     cur = requests.get(f"{OWM}/weather", params=p, timeout=15); cur.raise_for_status()
     fc = requests.get(f"{OWM}/forecast", params={**p, "cnt": 8}, timeout=15); fc.raise_for_status()
     c = cur.json()
     rain = sum(s.get("rain", {}).get("3h", 0) for s in fc.json()["list"])
-    return dict(city=c["name"], temp_c=c["main"]["temp"], humidity=c["main"]["humidity"], wind_ms=c["wind"]["speed"],
+    return dict(city=c["name"] or f"{c['coord']['lat']:.1f}, {c['coord']['lon']:.1f}", lat=c["coord"]["lat"], lon=c["coord"]["lon"], temp_c=c["main"]["temp"], humidity=c["main"]["humidity"], wind_ms=c["wind"]["speed"],
                 pressure_hpa=c["main"]["pressure"], clouds=c["clouds"]["all"], rain_24h_mm=rain)
 
 IRRIGATION = {
@@ -32,12 +33,16 @@ PEST = {
     "low": "Low pest pressure from weather. Routine scouting only.",
 }
 
-def advise(w):
+def predict(w):
     X = pd.DataFrame([{f: w[f] for f in FEATS}])
     out = {}
     for t in ("irrigation", "pest"):
         m = MODELS[t]; pr = m.predict_proba(X)[0]; i = pr.argmax()
         out[t] = (m.classes_[i], pr[i])
+    return out
+
+def advise(w):
+    out = predict(w)
     (ir, irp), (pe, pep) = out["irrigation"], out["pest"]
     # safety override: never spray in strong wind (drift) -- a rule on top of the model
     spray_note = " Wind is strong: postpone any spraying." if w["wind_ms"] > 8 else ""
