@@ -4,6 +4,8 @@ from train import FEATS
 
 MODELS = joblib.load(os.path.join(os.path.dirname(__file__), "model.joblib"))
 OWM = "https://api.openweathermap.org/data/2.5"
+_http = requests.Session()  # retries ride out the occasional TLS/connection reset
+_http.mount("https://", requests.adapters.HTTPAdapter(max_retries=requests.adapters.Retry(total=3, backoff_factor=0.5, status_forcelist=(429, 500, 502, 503, 504))))
 
 # Offline scenarios mirroring OWM readings, for demo without a key / without network.
 SCENARIOS = {
@@ -15,8 +17,8 @@ def live_weather(city=None, key=None, lat=None, lon=None):
     """Current conditions + next-24h forecast rain (8 x 3h slots) from OpenWeatherMap free tier."""
     p = dict(appid=key, units="metric")
     p.update(lat=lat, lon=lon) if lat is not None else p.update(q=city)
-    cur = requests.get(f"{OWM}/weather", params=p, timeout=15); cur.raise_for_status()
-    fc = requests.get(f"{OWM}/forecast", params={**p, "cnt": 8}, timeout=15); fc.raise_for_status()
+    cur = _http.get(f"{OWM}/weather", params=p, timeout=15); cur.raise_for_status()
+    fc = _http.get(f"{OWM}/forecast", params={**p, "cnt": 8}, timeout=15); fc.raise_for_status()
     c = cur.json()
     rain = sum(s.get("rain", {}).get("3h", 0) for s in fc.json()["list"])
     return dict(city=c["name"] or f"{c['coord']['lat']:.1f}, {c['coord']['lon']:.1f}", lat=c["coord"]["lat"], lon=c["coord"]["lon"], temp_c=c["main"]["temp"], humidity=c["main"]["humidity"], wind_ms=c["wind"]["speed"],

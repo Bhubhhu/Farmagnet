@@ -1,5 +1,4 @@
-import json, math, os, folium, streamlit as st
-from streamlit_folium import st_folium
+import json, math, os, plotly.graph_objects as go, streamlit as st
 from agent import predict, live_weather, IRRIGATION, PEST
 
 st.set_page_config(page_title="FarmAgent India", page_icon="🌾", layout="wide", initial_sidebar_state="collapsed")
@@ -28,30 +27,24 @@ st.markdown("""<style>
 .verdict p {margin:4px 0 0; font-size:.95rem; line-height:1.35}
 .ring {--p:0; margin-left:auto; flex:none; width:62px; height:62px; border-radius:50%; display:grid; place-items:center; font-weight:800; color:#0B2A1E;
        background:conic-gradient(#0B2A1E calc(var(--p)*1%), rgba(11,42,30,.2) 0); position:relative}
-.ring::before {content:""; position:absolute; inset:7px; border-radius:50%; background:inherit; background:var(--bg)}
+.ring::before {content:""; position:absolute; inset:7px; border-radius:50%; background:var(--bg)}
 .ring i {position:relative; font-style:normal; font-size:.85rem}
 .todo {margin:10px 0 0; padding-left:18px; color:var(--ink)} .todo li {margin:3px 0}
+.hint {background:#0B2A1E; border-radius:12px; padding:9px 12px; margin-top:12px; color:var(--lime); font-size:.9rem}
 div[data-testid="stButton"] button {background:var(--lime); color:var(--deep); border:0; border-radius:99px; font-weight:700}
 div[data-testid="stButton"] button:hover {background:#D4FF8A; color:var(--deep)}
 </style>""", unsafe_allow_html=True)
 
 HERE = os.path.dirname(__file__)
 @st.cache_data
-def load(name): return json.load(open(os.path.join(HERE, "data", name), encoding="utf-8"))
+def load(name):
+    gj = json.load(open(os.path.join(HERE, "data", name), encoding="utf-8"))
+    for f in gj["features"]:
+        p = f["properties"]; p["id"] = f'{p["state"]}|{p.get("district", "")}'
+    return gj
 
 @st.cache_data(ttl=600, show_spinner="Reading live weather...")
 def fetch(lat, lon): return live_weather(None, KEY, lat, lon)
-
-def inside(pt, geom):
-    """Ray-casting point-in-polygon on a GeoJSON Polygon/MultiPolygon (holes ignored: districts have none that matter)."""
-    x, y = pt
-    polys = [geom["coordinates"]] if geom["type"] == "Polygon" else geom["coordinates"]
-    for poly in polys:
-        ring, c = poly[0], False
-        for (x1, y1), (x2, y2) in zip(ring, ring[1:] + ring[:1]):
-            if (y1 > y) != (y2 > y) and x < (x2 - x1) * (y - y1) / (y2 - y1) + x1: c = not c
-        if c: return True
-    return False
 
 def bounds(feats):
     pts = []
@@ -61,66 +54,79 @@ def bounds(feats):
             for x in c: walk(x)
     for f in feats: walk(f["geometry"]["coordinates"])
     xs, ys = [p[0] for p in pts], [p[1] for p in pts]
-    return [[min(ys), min(xs)], [max(ys), max(xs)]]
+    return min(ys), min(xs), max(ys), max(xs)
 
 def view(feats):
-    (s, w), (n, e) = bounds(feats)
-    lat = (s + n) / 2
-    z = min(math.log2(780 * math.cos(math.radians(lat)) / max(n - s, .1)), math.log2(900 / max(e - w, .1)))
-    return [lat, (w + e) / 2], max(4, min(9, z))
+    s, w, n, e = bounds(feats); lat = (s + n) / 2
+    z = min(math.log2(560 * math.cos(math.radians(lat)) / max(n - s, .1)), math.log2(430 / max(e - w, .1))) - 1  # sized for a phone-width map; maplibre tiles are 512px
+    return dict(lat=lat, lon=(w + e) / 2), max(2.5, min(8.5, z))
 
 SAT = "https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}"
-def base(**kw): return folium.Map(tiles=SAT, attr="Esri World Imagery", min_zoom=4, max_zoom=12, zoom_control=True, **kw)
+
+def map_figure(gj, selected, center, zoom):
+    feats = gj["features"]; ids = [f["properties"]["id"] for f in feats]
+    names = [f["properties"].get("district") or f["properties"]["state"] for f in feats]
+    fig = go.Figure(go.Choroplethmap(
+        geojson=gj, locations=ids, featureidkey="properties.id", z=[1 if i == selected else 0 for i in ids], showscale=False,
+        colorscale=[[0, "#B7F25C"], [1, "#FFC247"]], text=names, hovertemplate="<b>%{text}</b><extra></extra>",
+        marker=dict(opacity=.3, line=dict(color="#FFFFFF", width=1.3)),
+        selected=dict(marker=dict(opacity=.3)), unselected=dict(marker=dict(opacity=.3))))
+    fig.update_layout(height=640, margin=dict(l=0, r=0, t=0, b=0), paper_bgcolor="rgba(0,0,0,0)", dragmode="pan",
+                      hoverlabel=dict(bgcolor="#10372A", font=dict(color="#EAF7E1", size=15)),
+                      map=dict(style="white-bg", center=center, zoom=zoom,
+                               layers=[dict(below="traces", sourcetype="raster", source=[SAT], sourceattribution="Esri World Imagery")]))
+    return fig
+
+def clicked(event, feats):
+    """Feature the user clicked, or None. Uses the point index, which is stable across reruns."""
+    pts = (event.selection.points if event and event.selection else None) or []
+    return feats[pts[-1]["point_index"]]["properties"] if pts else None
+
+def get_weather(lat, lon, label, scope):
+    if not KEY:
+        ss.err = "The server has no OpenWeatherMap key. Add OWM_API_KEY under the app's Secrets and reboot."; return
+    try:
+        w = dict(fetch(lat, lon)); w["city"] = label; ss.w, ss.scope, ss.err = w, scope, None
+    except Exception as e:
+        ss.w, ss.err = None, f"Weather lookup for {label} failed: {e}"
 
 ss = st.session_state
-ss.setdefault("state", None); ss.setdefault("district", None); ss.setdefault("w", None); ss.setdefault("err", None)
-stage = 1 if ss.state is None else 2 if ss.w is None else 3
+for k, v in dict(state=None, district=None, w=None, err=None, scope=None).items(): ss.setdefault(k, v)
+stage = 1 if ss.state is None else 2 if ss.district is None else 3
 cls = lambda n: "on" if stage == n else "done" if stage > n else ""
 st.markdown(f'<div class="top"><div class="logo">🌾 Farm<b>Agent</b> India</div><div class="steps">'
             f'<span class="step {cls(1)}">1 · Pick a state</span><span class="step {cls(2)}">2 · Pick a district</span>'
-            f'<span class="step {cls(3)}">3 · Read the advice</span></div></div>', unsafe_allow_html=True)
+            f'<span class="step {cls(3)}">3 · District advice</span></div></div>', unsafe_allow_html=True)
 
+CFG = dict(scrollZoom=True, displayModeBar=False)
 left, right = st.columns([5, 3], gap="large")
 with left:
     if ss.state is None:
         st.markdown('<div class="mapbar">🛰️ India <span class="chip">click a state</span></div>', unsafe_allow_html=True)
-        m = base(location=[22.5, 81], zoom_start=4.75, zoom_snap=0.25, min_lat=0, max_lat=42, min_lon=60, max_lon=105, max_bounds=True)
-        folium.GeoJson(load("states.geojson"),
-                       style_function=lambda f: dict(fillColor="#B7F25C", fillOpacity=.06, color="#FFFFFF", weight=1.6),
-                       highlight_function=lambda f: dict(fillColor="#B7F25C", fillOpacity=.45, color="#B7F25C", weight=3),
-                       tooltip=folium.GeoJsonTooltip(["state"], labels=False)).add_to(m)
-        hit = st_folium(m, height=640, use_container_width=True, returned_objects=["last_active_drawing"], key="india").get("last_active_drawing")
-        if hit and hit.get("properties", {}).get("state"):
-            ss.state, ss.district, ss.w, ss.err = hit["properties"]["state"], None, None, None
-            st.rerun()
+        gj = load("states.geojson")
+        ev = st.plotly_chart(map_figure(gj, None, dict(lat=22.5, lon=81), 3.6), key="india", on_select="rerun",
+                             selection_mode="points", config=CFG, use_container_width=True)
+        p = clicked(ev, gj["features"])
+        if p:
+            ss.state, ss.district = p["state"], None
+            get_weather(p["lat"], p["lon"], p["state"], "state"); st.rerun()
     else:
-        feats = [f for f in load("districts.geojson")["features"] if f["properties"]["state"] == ss.state]
+        gj = load("districts.geojson"); feats = [f for f in gj["features"] if f["properties"]["state"] == ss.state]
+        sub = dict(type="FeatureCollection", features=feats)
         a, b = st.columns([1, 4])
-        if a.button("← All India"): ss.state = ss.district = ss.w = ss.err = None; st.rerun()
-        b.markdown(f'<div class="mapbar">🛰️ {ss.state} <span class="chip">{len(feats)} districts · click one</span></div>', unsafe_allow_html=True)
-        loc, z = view(feats)
-        m = base(location=loc, zoom_start=z, zoom_snap=0.25); sel = ss.district
-        folium.GeoJson({"type": "FeatureCollection", "features": feats},
-                       style_function=lambda f: dict(fillColor="#FFC247" if f["properties"]["district"] == sel else "#B7F25C",
-                                                     fillOpacity=.5 if f["properties"]["district"] == sel else .06, color="#FFFFFF", weight=1.4),
-                       highlight_function=lambda f: dict(fillColor="#B7F25C", fillOpacity=.45, color="#B7F25C", weight=3),
-                       tooltip=folium.GeoJsonTooltip(["district"], labels=False)).add_to(m)
-        out = st_folium(m, height=640, use_container_width=True, returned_objects=["last_active_drawing", "last_clicked"], key=f"state-{ss.state}")
-        p = ((out.get("last_active_drawing") or {}).get("properties")) or {}
-        ck = out.get("last_clicked")
-        if not p.get("district") and ck:  # fallback: locate the clicked district ourselves
-            p = next((f["properties"] for f in feats if inside((ck["lng"], ck["lat"]), f["geometry"])), {})
-        if st.query_params.get("debug"): st.caption(f"debug: drawing={out.get('last_active_drawing') is not None} clicked={ck} picked={p.get('district')}")
-        if p.get("district") and p["district"] != ss.district:
-            if not KEY:
-                ss.err = "The server has no OpenWeatherMap key. Add OWM_API_KEY under the app's Secrets and reboot."
-            else:
-                try:
-                    w = fetch(p["lat"], p["lon"]); w["city"] = p["district"]
-                    ss.district, ss.w, ss.err = p["district"], w, None
-                except Exception as e:
-                    ss.district, ss.w, ss.err = p["district"], None, f"Weather lookup for {p['district']} failed: {e}"
+        if a.button("← All India"):
+            for k in ("state", "district", "w", "err", "scope"): ss[k] = None
             st.rerun()
+        b.markdown(f'<div class="mapbar">🛰️ {ss.state} <span class="chip">{len(feats)} districts · click one</span></div>', unsafe_allow_html=True)
+        center, zoom = view(feats)
+        sel = f"{ss.state}|{ss.district}" if ss.district else None
+        ev = st.plotly_chart(map_figure(sub, sel, center, zoom), key=f"state-{ss.state}", on_select="rerun",
+                             selection_mode="points", config=CFG, use_container_width=True)
+        p = clicked(ev, feats)
+        if p and p["district"] != ss.district:
+            ss.district = p["district"]
+            get_weather(p["lat"], p["lon"], p["district"], "district"); st.rerun()
+        if st.query_params.get("debug"): st.caption(f"debug: selection={ev.selection.points if ev and ev.selection else None}")
 
 TODO = {
     "skip": ["Hold all irrigation today", "Dip-check soil at 5 cm before the next cycle", "Keep field drains clear"],
@@ -143,16 +149,17 @@ with right:
     if ss.err:
         st.markdown(f'<div class="panel" style="border-color:#FF7A59"><h3>⚠️ No advice yet</h3><div class="muted">{ss.err}</div></div>', unsafe_allow_html=True)
     elif not w:
-        msg = "Click any state on the satellite map." if ss.state is None else f"Click a district of {ss.state}."
-        st.markdown(f'<div class="panel"><h3>👈 {msg}</h3><div class="muted">FarmAgent reads live weather for the district and an ML model decides today\'s irrigation and pest advice.</div></div>', unsafe_allow_html=True)
+        st.markdown('<div class="panel"><h3>👈 Click any state on the satellite map.</h3><div class="muted">FarmAgent reads live weather for the place you pick and an ML model decides irrigation and pest advice.</div></div>', unsafe_allow_html=True)
     else:
         r = predict(w)
         conds = "".join(f'<div class="cond"><span>{n}</span><b>{v}</b></div>' for n, v in [
             ("Temp", f'{w["temp_c"]:.0f}°C'), ("Humidity", f'{w["humidity"]:.0f}%'), ("Wind", f'{w["wind_ms"]:.1f} m/s'),
             ("Rain 24h", f'{w["rain_24h_mm"]:.1f} mm'), ("Clouds", f'{w["clouds"]:.0f}%'), ("Pressure", f'{w["pressure_hpa"]:.0f} hPa')])
         (il, ip), (pl, pp) = r["irrigation"], r["pest"]
-        html = (f'<div class="panel"><div class="muted">📍 {ss.state} · live now</div><h3>{w["city"]}</h3><div class="conds">{conds}</div>'
-                + verdict("Irrigation", il, ip, *IC[il], IRRIGATION[il]) + verdict("Pest watch", pl, pp, *PC[pl], PEST[pl]) + "</div>")
-        st.markdown(html, unsafe_allow_html=True)
+        state_level = ss.scope == "state"
+        head = f'{ss.state} · state overview' if state_level else f'{ss.state} · district'
+        hint = '<div class="hint">👆 This is the state overview. Click a district on the map for local advice.</div>' if state_level else ""
+        st.markdown(f'<div class="panel"><div class="muted">📍 {head} · live now</div><h3>{w["city"]}</h3>{hint}<div class="conds">{conds}</div>'
+                    + verdict("Irrigation", il, ip, *IC[il], IRRIGATION[il]) + verdict("Pest watch", pl, pp, *PC[pl], PEST[pl]) + "</div>", unsafe_allow_html=True)
         if w["wind_ms"] > 8: st.warning("Wind is strong: postpone any spraying.")
-st.caption("Weather is read at one point inside each district. Boundaries are simplified and older (Telangana sits inside Andhra Pradesh, Ladakh inside Jammu & Kashmir). Guidance only, not agronomist advice.")
+st.caption("Weather is read at one point inside each state or district. Boundaries are simplified and older (Telangana sits inside Andhra Pradesh, Ladakh inside Jammu & Kashmir). Guidance only, not agronomist advice.")
