@@ -1,9 +1,9 @@
 """Train supervised models: OWM-style weather features -> irrigation class & pest-risk class.
 Training weather/ET0 comes from Open-Meteo archive (free, historical; OWM free tier has no history)."""
 import time, joblib, requests, pandas as pd
-from sklearn.ensemble import RandomForestClassifier
+from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor
 from sklearn.model_selection import train_test_split
-from sklearn.metrics import classification_report
+from sklearn.metrics import classification_report, mean_absolute_error, r2_score
 
 # varied climates so the model sees hot-dry, humid, monsoon, temperate
 CITIES = {"Delhi": (28.6, 77.2), "Mumbai": (19.1, 72.9), "Ludhiana": (30.9, 75.9), "Bengaluru": (13.0, 77.6),
@@ -48,4 +48,10 @@ if __name__ == "__main__":
         m = RandomForestClassifier(n_estimators=150, min_samples_leaf=3, n_jobs=-1, random_state=0).fit(Xtr, ytr)
         print(f"\n== {target} ==\n", classification_report(yte, m.predict(Xte), digits=3))
         models[target] = m
+    # Regression: predict reference evapotranspiration (mm/day) = how much water the air pulls from a crop today.
+    Xtr, Xte, ytr, yte = train_test_split(df[FEATS], df["et0"], test_size=0.2, random_state=0)
+    reg = RandomForestRegressor(n_estimators=80, min_samples_leaf=8, n_jobs=-1, random_state=0).fit(Xtr, ytr)
+    pred = reg.predict(Xte); mae = mean_absolute_error(yte, pred)
+    print(f"\n== ET0 regression ==\n MAE {mae:.2f} mm/day, R2 {r2_score(yte, pred):.3f}")
+    models["et0"], models["et0_mae"] = reg, float(mae)
     joblib.dump(models, "model.joblib", compress=3)

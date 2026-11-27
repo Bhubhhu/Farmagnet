@@ -1,5 +1,5 @@
 """FarmAgent: fetch live weather (OpenWeatherMap) -> ML prediction -> weather-aware advice."""
-import os, sys, joblib, requests, pandas as pd
+import math, os, sys, joblib, requests, pandas as pd
 from train import FEATS
 
 MODELS = joblib.load(os.path.join(os.path.dirname(__file__), "model.joblib"))
@@ -43,15 +43,85 @@ def predict(w):
         out[t] = (m.classes_[i], pr[i])
     return out
 
-def advise(w):
-    out = predict(w)
-    (ir, irp), (pe, pep) = out["irrigation"], out["pest"]
-    # safety override: never spray in strong wind (drift) -- a rule on top of the model
-    spray_note = " Wind is strong: postpone any spraying." if w["wind_ms"] > 8 else ""
-    return (f"[{w['city']}] {w['temp_c']:.0f}C, RH {w['humidity']:.0f}%, wind {w['wind_ms']:.1f} m/s, rain next 24h {w['rain_24h_mm']:.1f} mm\n"
-            f"  Irrigation ({irp:.0%}): {IRRIGATION[ir]}\n  Pest ({pep:.0%}): {PEST[pe]}{spray_note}")
+# crop: (Kc mid-season from FAO-56, main disease when humid, main pests when hot-dry). General guidance, not a local extension bulletin.
+CROPS = {
+    "General crop": (1.00, "fungal leaf diseases", "mites and aphids"),
+    "Wheat": (1.15, "yellow rust and powdery mildew", "aphids"),
+    "Rice": (1.20, "blast and sheath blight", "thrips and planthoppers"),
+    "Maize": (1.20, "leaf blights", "spider mites and aphids"),
+    "Cotton": (1.15, "boll rot and leaf spots", "whitefly, jassids and spider mites"),
+    "Sugarcane": (1.25, "red rot and leaf spots", "pyrilla and mites"),
+    "Tomato": (1.15, "early and late blight", "spider mites and whitefly"),
+    "Potato": (1.15, "late blight", "aphids and mites"),
+    "Mustard": (1.15, "Alternaria blight and white rust", "mustard aphid"),
+}
+
+def _level(v, lo, hi):  # 0 good, 1 watch, 2 alert for a low/high threshold pair
+    return 0 if v < lo else 1 if v < hi else 2
+
+def analyse(w, crop="General crop"):
+    """Everything the UI shows: ML prediction, physics-based indicators, and a rule-based prescription on top."""
+    kc, wet, dry = CROPS[crop]
+    X = pd.DataFrame([{f: w[f] for f in FEATS}])
+    t, rh, wind, rain = w["temp_c"], w["humidity"], w["wind_ms"], w["rain_24h_mm"]
+    # ML predictions (supervised): ET0 regression + irrigation/pest classifiers with class probabilities
+    et0 = max(0.0, float(MODELS["et0"].predict(X)[0])); mae = MODELS["et0_mae"]
+    probs = {k: dict(zip(MODELS[k].classes_, MODELS[k].predict_proba(X)[0])) for k in ("irrigation", "pest")}
+    pest = max(probs["pest"], key=probs["pest"].get)
+    # water balance (FAO-56): crop need = Kc x ET0, minus 80% of forecast rain
+    etc, credit = kc * et0, 0.8 * rain
+    net = max(0.0, etc - credit)
+    irr = "skip" if net < 1.5 else "light" if net < 4 else "heavy"
+    # physics indicators
+    es = 0.6108 * math.exp(17.27 * t / (t + 237.3)); vpd = es * (1 - rh / 100)
+    g = math.log(max(rh, 1) / 100) + 17.27 * t / (237.3 + t); dew = 237.3 * g / (17.27 - g); spread = t - dew
+    spray = ("good", "Good spray window: calm air.") if wind < 3 else ("ok", "Spray with coarse droplets; drift risk is moderate.") if wind <= 8 else ("no", "Too windy to spray; wait for calmer air.")
+    if rain >= 2: spray = ("no", f"{rain:.0f} mm rain is forecast and would wash sprays off; wait for a dry spell.")
+    ind = [
+        ("Evaporative demand (ET0)", f"{et0:.1f} mm/day", f"model estimate, typical error ±{mae:.1f}", _level(et0, 3, 5)),
+        (f"{crop} water need", f"{etc:.1f} mm/day", f"ET0 × crop factor {kc:.2f}", 0),
+        ("Rain credit", f"{credit:.1f} mm", f"80% of the {rain:.1f} mm forecast for 24 h counts as usable", 0 if credit >= 1 else 1),
+        ("Air dryness (VPD)", f"{vpd:.1f} kPa", "humid air, fungus-friendly" if vpd < 0.4 else "comfortable for crops" if vpd < 1.2 else "dry air, plants lose water fast" if vpd < 2 else "very dry air, plants under stress",
+         1 if vpd < 0.4 else 0 if vpd < 1.2 else 1 if vpd < 2 else 2),
+        ("Leaf wetness", f"{spread:.1f} °C gap", "dew point is close to air temperature: leaves stay wet" if spread < 2 else "some dew likely overnight" if spread < 5 else "leaves dry out quickly", 2 if spread < 2 else 1 if spread < 5 else 0),
+        ("Heat stress", f"{t:.0f} °C", "hot: crop stress likely" if t >= 35 else "warm" if t >= 30 else "comfortable", _level(t, 30, 35)),
+    ]
+    # prescription
+    litres = net * 4046.86  # 1 mm over 1 acre
+    when = "5-8 am (cooler, less evaporation)" if t >= 25 else "mid-morning"
+    water = {
+        "skip": [(f"No irrigation today: the forecast rain credit of {credit:.1f} mm covers the crop's {etc:.1f} mm need." if credit >= etc else f"No irrigation today: the crop needs only {etc:.1f} mm and the air is not pulling much water."),
+                 "Check soil by hand at 5 cm depth; irrigate only if it crumbles dry." if rain < 2 else "Keep field drains clear so rain does not waterlog roots.",
+                 "Re-check tomorrow morning" + (" and again after the rain." if rain >= 5 else ".")],
+        "light": [f"Apply about {net:.1f} mm (≈ {litres:,.0f} L per acre).", f"Best time: {when}; avoid 11 am to 4 pm.",
+                  "Drip or furrow wastes less water than sprinklers" + (" (wind will blow sprinkler water away)." if wind > 5 else "."), "Re-check soil moisture tomorrow."],
+        "heavy": [f"Apply about {net:.1f} mm (≈ {litres:,.0f} L per acre)" + (f", in 2 passes of {net/2:.1f} mm a few hours apart to avoid runoff." if net > 6 else "."),
+                  f"Best time: {when}; avoid 11 am to 4 pm.", "Mulch or keep crop residue on the soil to cut evaporation.", "Water young and flowering plants first; they suffer most from stress."],
+    }[irr]
+    if pest == "fungal":
+        threat = wet
+        steps = [f"Scout for {wet} within 24 h: check lower and inner leaves for spots, mould or water-soaked patches; repeat in 3 days.",
+                 "Water by drip or furrow, in the morning only; wet leaves overnight raise disease risk.",
+                 f"If symptoms appear, apply a protectant fungicide per the local label. {spray[1]}", "Open up airflow: remove weeds and badly infected lower leaves."]
+    elif pest == "mites_aphids":
+        threat = dry
+        steps = [f"Scout for {dry}: tap a leaf over white paper, look under leaves and at growing tips.",
+                 "Hot, dry air multiplies them fast. Keep plants watered; stressed plants get hit hardest.",
+                 f"If you find colonies, spray neem oil (about 5 ml per litre) or a water jet in the evening. {spray[1]}", "Avoid broad-spectrum insecticides; they kill natural predators."]
+    else:
+        threat = "no weather-driven threat"
+        steps = ["Weather does not favour pests today.", "Do your routine weekly field walk.", f"Weather only: still watch for {wet} if humid weather returns."]
+    return dict(crop=crop, kc=kc, et0=et0, mae=mae, etc=etc, credit=credit, net=net, litres=litres, irr=irr, irr_probs=probs["irrigation"], pest=pest,
+                pest_probs=probs["pest"], vpd=vpd, spread=spread, indicators=ind, spray=spray, water_steps=water, pest_steps=steps, threat=threat)
+
+def advise(w, crop="General crop"):
+    a = analyse(w, crop)
+    return (f"[{w['city']}] {w['temp_c']:.0f}C, RH {w['humidity']:.0f}%, wind {w['wind_ms']:.1f} m/s, rain next 24h {w['rain_24h_mm']:.1f} mm  (crop: {crop})\n"
+            f"  Irrigation ({a['irr_probs'][a['irr']]:.0%} model): {IRRIGATION[a['irr']]}\n   - " + "\n   - ".join(a["water_steps"]) +
+            f"\n  Pest ({a['pest_probs'][a['pest']]:.0%}): {PEST[a['pest']]}\n   - " + "\n   - ".join(a["pest_steps"]))
 
 if __name__ == "__main__":
+    sys.stdout.reconfigure(encoding="utf-8")  # Windows consoles default to cp1252
     key, city = os.getenv("OWM_API_KEY"), (sys.argv[1] if len(sys.argv) > 1 else None)
     if key and city: print(advise(live_weather(city, key)))
     else:

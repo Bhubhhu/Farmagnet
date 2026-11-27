@@ -1,5 +1,5 @@
 import json, math, os, plotly.graph_objects as go, streamlit as st
-from agent import predict, live_weather, IRRIGATION, PEST
+from agent import analyse, live_weather, CROPS
 
 st.set_page_config(page_title="FarmAgent India", page_icon="🌾", layout="wide", initial_sidebar_state="collapsed")
 
@@ -31,6 +31,12 @@ st.markdown("""<style>
 .ring i {position:relative; font-style:normal; font-size:.85rem}
 .todo {margin:10px 0 0; padding-left:18px; color:var(--ink)} .todo li {margin:3px 0}
 .hint {background:#0B2A1E; border-radius:12px; padding:9px 12px; margin-top:12px; color:var(--lime); font-size:.9rem}
+.bars {margin:6px 0 14px} .bar-row {display:flex; align-items:center; gap:10px; margin:5px 0; font-size:.9rem}
+.bar-row b {width:120px; font-weight:600} .track {flex:1; background:var(--deep); border-radius:99px; height:12px} .track i {display:block; height:12px; border-radius:99px; background:var(--lime)}
+.ind {display:flex; gap:12px; align-items:flex-start; padding:10px 0; border-bottom:1px solid #1d4f39} .ind:last-child {border:0}
+.dot {flex:none; width:12px; height:12px; border-radius:50%; margin-top:6px} .ind b {color:var(--ink)} .ind small {display:block; color:#9FD3B0; font-size:.85rem}
+.ind .v {margin-left:auto; font-weight:800; color:var(--ink); white-space:nowrap}
+.sub {font-size:.9rem; opacity:.85; margin-top:2px}
 div[data-testid="stButton"] button {background:var(--lime); color:var(--deep); border:0; border-radius:99px; font-weight:700}
 div[data-testid="stButton"] button:hover {background:#D4FF8A; color:var(--deep)}
 </style>""", unsafe_allow_html=True)
@@ -128,38 +134,61 @@ with left:
             get_weather(p["lat"], p["lon"], p["district"], "district"); st.rerun()
         if st.query_params.get("debug"): st.caption(f"debug: selection={ev.selection.points if ev and ev.selection else None}")
 
-TODO = {
-    "skip": ["Hold all irrigation today", "Dip-check soil at 5 cm before the next cycle", "Keep field drains clear"],
-    "light": ["Run a short drip or sprinkler cycle", "Water early morning to cut evaporation", "Recheck soil moisture tomorrow"],
-    "heavy": ["Irrigate deeply before 9am or after 6pm", "Mulch to slow water loss", "Prioritise young or flowering crops first"],
-    "fungal": ["Scout leaves for spots and mould", "Avoid overhead watering", "Protectant fungicide once the rain stops"],
-    "mites_aphids": ["Check leaf undersides for mites and aphids", "Spray water or neem oil in the evening", "Avoid water stress on stressed plants"],
-    "low": ["Routine scouting only", "Keep a weekly walk-through", "Log anything unusual"],
-}
-IC = {"skip": ("#4CC9F0", "🌧️", "Skip irrigation"), "light": ("#FFC247", "💧", "Light irrigation"), "heavy": ("#FF7A59", "💦", "Irrigate heavily")}
+IC = {"skip": ("#4CC9F0", "🌧️"), "light": ("#FFC247", "💧"), "heavy": ("#FF7A59", "💦")}
 PC = {"low": ("#7EE08F", "✅", "Low pest risk"), "fungal": ("#4CC9F0", "🍄", "Fungal risk"), "mites_aphids": ("#FFC247", "🐛", "Mites & aphids risk")}
+DOT = ["#7EE08F", "#FFC247", "#FF7A59"]
+NICE = {"skip": "Skip", "light": "Light", "heavy": "Heavy", "low": "Low", "fungal": "Fungal", "mites_aphids": "Mites & aphids"}
 
-def verdict(kind, lab, p, col, ico, title, text):
-    items = "".join(f"<li>{t}</li>" for t in TODO[lab])
-    return (f'<div class="verdict" style="background:{col}"><div class="ico">{ico}</div><div><small>{kind}</small><h4>{title}</h4><p>{text}</p></div>'
-            f'<div class="ring" style="--p:{p*100:.0f}; --bg:{col}"><i>{p:.0%}</i></div></div><ul class="todo">{items}</ul>')
+def card(kind, col, ico, title, sub, p, steps):
+    items = "".join(f"<li>{t}</li>" for t in steps)
+    return (f'<div class="verdict" style="background:{col}"><div class="ico">{ico}</div><div><small>{kind}</small><h4>{title}</h4><div class="sub">{sub}</div></div>'
+            f'<div class="ring" style="--p:{p*100:.0f}; --bg:{col}" title="Model probability for this class"><i>{p:.0%}</i></div></div><ul class="todo">{items}</ul>')
+
+def bars(probs):
+    return '<div class="bars">' + "".join(f'<div class="bar-row"><b>{NICE[k]}</b><div class="track"><i style="width:{v*100:.0f}%"></i></div><span>{v:.0%}</span></div>'
+                                          for k, v in sorted(probs.items(), key=lambda kv: -kv[1])) + "</div>"
 
 with right:
+    crop = st.selectbox("🌱 Your crop", list(CROPS), key="crop", help="Sets the crop water factor (Kc) and the diseases and pests to watch for.")
     w = ss.w
     if ss.err:
         st.markdown(f'<div class="panel" style="border-color:#FF7A59"><h3>⚠️ No advice yet</h3><div class="muted">{ss.err}</div></div>', unsafe_allow_html=True)
     elif not w:
-        st.markdown('<div class="panel"><h3>👈 Click any state on the satellite map.</h3><div class="muted">FarmAgent reads live weather for the place you pick and an ML model decides irrigation and pest advice.</div></div>', unsafe_allow_html=True)
+        st.markdown('<div class="panel"><h3>👈 Click any state on the satellite map.</h3><div class="muted">FarmAgent reads live weather for the place you pick, a trained model predicts water demand and pest risk, and rules turn that into a plan for your crop.</div></div>', unsafe_allow_html=True)
     else:
-        r = predict(w)
+        a = analyse(w, crop)
+        state_level = ss.scope == "state"
+        head = f'{ss.state} · state overview' if state_level else f'{ss.state} · district'
+        hint = '<div class="hint">👆 State overview. Click a district on the map for local advice.</div>' if state_level else ""
         conds = "".join(f'<div class="cond"><span>{n}</span><b>{v}</b></div>' for n, v in [
             ("Temp", f'{w["temp_c"]:.0f}°C'), ("Humidity", f'{w["humidity"]:.0f}%'), ("Wind", f'{w["wind_ms"]:.1f} m/s'),
             ("Rain 24h", f'{w["rain_24h_mm"]:.1f} mm'), ("Clouds", f'{w["clouds"]:.0f}%'), ("Pressure", f'{w["pressure_hpa"]:.0f} hPa')])
-        (il, ip), (pl, pp) = r["irrigation"], r["pest"]
-        state_level = ss.scope == "state"
-        head = f'{ss.state} · state overview' if state_level else f'{ss.state} · district'
-        hint = '<div class="hint">👆 This is the state overview. Click a district on the map for local advice.</div>' if state_level else ""
-        st.markdown(f'<div class="panel"><div class="muted">📍 {head} · live now</div><h3>{w["city"]}</h3>{hint}<div class="conds">{conds}</div>'
-                    + verdict("Irrigation", il, ip, *IC[il], IRRIGATION[il]) + verdict("Pest watch", pl, pp, *PC[pl], PEST[pl]) + "</div>", unsafe_allow_html=True)
-        if w["wind_ms"] > 8: st.warning("Wind is strong: postpone any spraying.")
+        st.markdown(f'<div class="panel"><div class="muted">📍 {head} · live now · {crop}</div><h3>{w["city"]}</h3>{hint}<div class="conds">{conds}</div></div>', unsafe_allow_html=True)
+        t1, t2, t3, t4 = st.tabs(["✅ What to do", "🔬 Why (analysis)", "🤖 Model prediction", "ℹ️ About"])
+        with t1:
+            icol, iico = IC[a["irr"]]
+            if a["irr"] == "skip": ititle, isub = "Skip irrigation today", f'Crop need {a["etc"]:.1f} mm · rain credit {a["credit"]:.1f} mm'
+            else: ititle, isub = f'Apply about {a["net"]:.0f} mm today', f'≈ {a["litres"]:,.0f} litres per acre · {crop}'
+            pcol, pico, ptitle = PC[a["pest"]]
+            st.markdown(card("Irrigation plan", icol, iico, ititle, isub, a["irr_probs"][a["irr"]], a["water_steps"])
+                        + card("Pest plan", pcol, pico, ptitle, f'Watch for: {a["threat"]}', a["pest_probs"][a["pest"]], a["pest_steps"]), unsafe_allow_html=True)
+            if w["wind_ms"] > 8: st.warning("Wind is strong: postpone any spraying.")
+            st.caption("The ring shows how sure the trained model is about this class.")
+        with t2:
+            rows = "".join(f'<div class="ind"><span class="dot" style="background:{DOT[lv]}"></span><div><b>{n}</b><small>{note}</small></div><span class="v">{v}</span></div>'
+                           for n, v, note, lv in a["indicators"])
+            sp = {"good": 0, "ok": 1, "no": 2}[a["spray"][0]]
+            rows += f'<div class="ind"><span class="dot" style="background:{DOT[sp]}"></span><div><b>Spray window</b><small>{a["spray"][1]}</small></div><span class="v">{w["wind_ms"]:.1f} m/s</span></div>'
+            st.markdown(f'<div class="panel">{rows}</div>', unsafe_allow_html=True)
+            st.caption("Green is fine, amber is worth watching, red needs action.")
+        with t3:
+            st.markdown(f'<div class="panel"><b>Water demand (regression)</b><div class="muted">Predicted evaporation demand today: <b style="color:#EAF7E1">{a["et0"]:.1f} mm/day</b> (typical error ±{a["mae"]:.1f} mm).</div>'
+                        f'<br><b>Irrigation class (generic crop)</b>{bars(a["irr_probs"])}<b>Pest class</b>{bars(a["pest_probs"])}</div>', unsafe_allow_html=True)
+        with t4:
+            st.markdown("""<div class="panel"><b>What you are looking at</b><ul class="todo">
+<li><b>Prediction:</b> three trained Random Forest models read the live weather. One regression predicts water demand (ET0, R² 0.92), two classifiers label irrigation need and pest risk.</li>
+<li><b>Analysis:</b> physics formulas on the same weather: vapour-pressure deficit, dew-point gap, heat stress and the spray window.</li>
+<li><b>Prescription:</b> rules turn the predictions into amounts and timing: crop need = Kc × ET0, minus 80% of forecast rain.</li></ul>
+<b>Data</b><div class="muted">Live weather: OpenWeatherMap. Training: 6 years of Open-Meteo daily weather for 8 climates. Boundaries: public GADM-based India map.</div><br>
+<b>Limits</b><div class="muted">Training labels come from agronomy formulas, not field trials. Weather is read at one point per place. Crop factors are mid-season values; young crops need less. Treat this as guidance and confirm with your local agriculture office.</div></div>""", unsafe_allow_html=True)
 st.caption("Weather is read at one point inside each state or district. Boundaries are simplified and older (Telangana sits inside Andhra Pradesh, Ladakh inside Jammu & Kashmir). Guidance only, not agronomist advice.")
